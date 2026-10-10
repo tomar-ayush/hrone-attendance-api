@@ -9,22 +9,89 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from pymongo import MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.errors import PyMongoError
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+# tz_aware so every datetime coming back from MongoDB is an aware UTC instant
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    tz_aware=True,
+    serverSelectionTimeoutMS=5000,
+)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+def ensure_indexes():
+    db.employees.create_index([("emp_code", ASCENDING)], unique=True)
+    db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
+    db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
+    db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    ensure_indexes()
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
+
+
+# --------------------------------------------------------------------------- #
+# Instants: BSON datetime (UTC) in MongoDB <-> epoch milliseconds in the API
+# --------------------------------------------------------------------------- #
+def ms_to_dt(ms: int) -> datetime:
+    # R1: truncate to whole seconds
+    return datetime.fromtimestamp(ms // 1000, tz=timezone.utc)
+
+
+def dt_to_ms(dt: Optional[datetime]) -> Optional[int]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp()) * 1000
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def serialize_employee(doc: dict) -> dict:
+    doc.pop("_id", None)
+    doc["created_at"] = dt_to_ms(doc.get("created_at"))
+    return doc
+
+
+def serialize_log(doc: dict) -> dict:
+    doc.pop("_id", None)
+    doc["punch_in"] = dt_to_ms(doc.get("punch_in"))
+    doc["punch_out"] = dt_to_ms(doc.get("punch_out"))
+    doc.setdefault("work_hours", None)
+    doc.setdefault("late_minutes", 0)
+    doc.setdefault("overtime_minutes", 0)
+    doc.setdefault("half_day", False)
+    history = doc.get("history") or []
+    for entry in history:
+        entry["at"] = dt_to_ms(entry.get("at"))
+        for field in ("punch_in", "punch_out"):
+            change = entry.get("changes", {}).get(field)
+            if change:
+                change["from"] = dt_to_ms(change.get("from"))
+                change["to"] = dt_to_ms(change.get("to"))
+    doc["history"] = history
+    return doc
 
 
 # --------------------------------------------------------------------------- #
@@ -71,6 +138,10 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        db.command("ping")
+    except PyMongoError:
+        raise HTTPException(503, "MongoDB unavailable")
     return {"status": "ok"}
 
 
