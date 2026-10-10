@@ -218,6 +218,15 @@ class PunchOutIn(BaseModel):
     punched_at: Optional[EpochMillis] = None
 
 
+class RegularizeIn(BaseModel):
+    # derived fields sent by a client are ignored (pydantic drops unknown keys)
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMillis] = None
+    punch_out: Optional[EpochMillis] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
 PageParam = Annotated[int, Query(ge=1)]
 PageSizeParam = Annotated[int, Query(ge=1, le=100)]
 
@@ -349,9 +358,56 @@ def punch_out(body: PunchOutIn):
     return serialize_log(updated)
 
 
+TRACKED_FIELDS = ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day")
+FIELD_DEFAULTS = {"work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: str, body: RegularizeIn):
+    date = query_date(date)
+    emp = get_employee_or_404(emp_code)
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not rec:
+        raise HTTPException(404, "no attendance record for that date")
+
+    status = body.status or rec["status"]
+    if status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, f"{status} cannot have punch times")
+        punch_in = punch_out = None
+    else:
+        punch_in = ms_to_dt(body.punch_in) if body.punch_in is not None else rec.get("punch_in")
+        punch_out = ms_to_dt(body.punch_out) if body.punch_out is not None else rec.get("punch_out")
+        if punch_in is None:
+            raise HTTPException(422, f"{status} requires a punch_in")
+        if attendance_date(punch_in, emp) != date:
+            raise HTTPException(422, "punch_in must stay on the record's attendance date")
+        if punch_out is not None:
+            check_punch_window(punch_in, punch_out)
+
+    new = {"status": status, "punch_in": punch_in, "punch_out": punch_out, **derived_fields(emp, date, punch_in, punch_out)}
+    changes = {
+        f: {"from": rec.get(f, FIELD_DEFAULTS.get(f)), "to": new[f]}
+        for f in TRACKED_FIELDS
+        if rec.get(f, FIELD_DEFAULTS.get(f)) != new[f]
+    }
+    if not changes:
+        raise HTTPException(422, "request changes nothing")
+
+    entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    updated = db.attendance_logs.find_one_and_update(
+        # optimistic lock on the values this entry's "from" side was computed against
+        {"_id": rec["_id"], "status": rec["status"], "punch_in": rec.get("punch_in"), "punch_out": rec.get("punch_out")},
+        {"$set": new, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(409, "record was modified concurrently, retry")
+    return serialize_log(updated)
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
