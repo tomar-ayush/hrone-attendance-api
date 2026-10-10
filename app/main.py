@@ -9,6 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import calendar
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
@@ -41,6 +43,7 @@ def ensure_indexes():
     db.employees.create_index([("joined_on", ASCENDING)])
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
     db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
+    db.attendance_logs.create_index([("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)])
 
 
 @asynccontextmanager
@@ -631,6 +634,57 @@ def department_trend(department: str, date_from: Annotated[str, Query(alias="fro
 
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
+# Admin
 # --------------------------------------------------------------------------- #
+def require(value, name: str):
+    if value is None:
+        raise HTTPException(422, f"{name} is required for this endpoint")
+    return value
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    trend_from: Optional[str] = Query(None, alias="from"),
+    trend_to: Optional[str] = Query(None, alias="to"),
+    page: PageParam = 1,
+    page_size: PageSizeParam = 20,
+):
+    # same query/pipeline the real endpoint runs, built by the same functions
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        command = {
+            "find": collection,
+            "filter": attendance_query(emp_code, date_from, date_to, status),
+            "sort": dict(ATTENDANCE_SORT),
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    else:
+        if endpoint == "employee_monthly":
+            collection = "attendance_logs"
+            pipeline = employee_monthly_pipeline(require(emp_code, "emp_code"), require(month, "month"))
+        elif endpoint == "department_summary":
+            collection = "employees"
+            pipeline = department_summary_pipeline(require(month, "month"), department)
+        elif endpoint == "late_leaderboard":
+            collection = "attendance_logs"
+            pipeline = late_leaderboard_pipeline(require(month, "month"), limit, department)
+        else:
+            collection = "attendance_logs"
+            date_from, date_to = query_date(require(trend_from, "from")), query_date(require(trend_to, "to"))
+            members = list(db.employees.find({"department": require(department, "department")}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+            if not members:
+                raise HTTPException(404, "department not found")
+            pipeline = department_trend_pipeline([e["emp_code"] for e in members], [e["joined_on"] for e in members], date_from, date_to)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+    raw = db.command({"explain": command, "verbosity": "executionStats"})
+    # explain output holds BSON types (dates, timestamps); json_util renders them as Extended JSON
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(raw))}
