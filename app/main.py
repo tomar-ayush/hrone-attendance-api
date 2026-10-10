@@ -18,7 +18,7 @@ from typing import Annotated, Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
@@ -213,6 +213,11 @@ class PunchInIn(BaseModel):
     status: PresenceStatus = "PRESENT"
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMillis] = None
+
+
 PageParam = Annotated[int, Query(ge=1)]
 PageSizeParam = Annotated[int, Query(ge=1, le=100)]
 
@@ -314,9 +319,38 @@ def list_attendance(
     return {"items": [serialize_log(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
+def check_punch_window(punch_in: datetime, punch_out: datetime):
+    if punch_out <= punch_in:
+        raise HTTPException(422, "punch_out must be after punch_in")
+    if punch_out - punch_in > timedelta(hours=24):
+        raise HTTPException(422, "punch_out must be within 24 hours of punch_in")
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = get_employee_or_404(body.emp_code)
+    ts = ms_to_dt(body.punched_at) if body.punched_at else now_utc()
+    # most recent record with a punch-in at or before ts; date order == punch_in order for one employee
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("date", DESCENDING)]
+    )
+    if not rec:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+    check_punch_window(rec["punch_in"], ts)
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},  # only one concurrent punch-out can match
+        {"$set": {"punch_out": ts, **derived_fields(emp, rec["date"], rec["punch_in"], ts)}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(409, "already punched out")
+    return serialize_log(updated)
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
