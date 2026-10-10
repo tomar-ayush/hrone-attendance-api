@@ -38,6 +38,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def ensure_indexes():
     db.employees.create_index([("emp_code", ASCENDING)], unique=True)
     db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
+    db.employees.create_index([("joined_on", ASCENDING)])
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
     db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
 
@@ -474,9 +475,68 @@ def employee_monthly(emp_code: str, month: MonthParam):
     }
 
 
+def department_summary_pipeline(month: str, department: Optional[str]) -> list:
+    first, last = month_bounds(month)
+    match = {"joined_on": {"$lte": last.isoformat()}}  # R9 headcount
+    if department:
+        match["department"] = department
+    has_hours = {"$and": [IS_PRESENT, {"$ne": [{"$ifNull": ["$work_hours", None]}, None]}]}
+    return [
+        {"$match": match},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": [
+                {"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
+                {"$group": {
+                    "_id": None,
+                    "present_days": {"$sum": {"$cond": [IS_WEEKDAY, PRESENT_VALUE, 0]}},
+                    "hours_sum": {"$sum": {"$cond": [has_hours, "$work_hours", 0]}},
+                    "hours_n": {"$sum": {"$cond": [has_hours, 1, 0]}},
+                    "late_count": {"$sum": {"$cond": [IS_LATE, 1, 0]}},
+                    "total_late_minutes": {"$sum": LATE_MINUTES},
+                    "leave_count": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                    "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]}},
+                }},
+            ],
+            "as": "agg",
+        }},
+        {"$unwind": {"path": "$agg", "preserveNullAndEmptyArrays": True}},  # keeps employees with no logs
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1},
+            "present_days": {"$sum": {"$ifNull": ["$agg.present_days", 0]}},
+            "hours_sum": {"$sum": {"$ifNull": ["$agg.hours_sum", 0]}},
+            "hours_n": {"$sum": {"$ifNull": ["$agg.hours_n", 0]}},
+            "late_count": {"$sum": {"$ifNull": ["$agg.late_count", 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$agg.total_late_minutes", 0]}},
+            "leave_count": {"$sum": {"$ifNull": ["$agg.leave_count", 0]}},
+            "on_duty_count": {"$sum": {"$ifNull": ["$agg.on_duty_count", 0]}},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: MonthParam, department: Optional[str] = None):
+    items = []
+    for row in db.employees.aggregate(department_summary_pipeline(month, department)):
+        items.append({
+            "department": row["_id"],
+            "headcount": row["headcount"],
+            "present_days": row["present_days"],
+            "avg_work_hours": round_half_up(Decimal(str(row["hours_sum"])) / row["hours_n"], 2) if row["hours_n"] else None,
+            "late_count": row["late_count"],
+            "total_late_minutes": row["total_late_minutes"],
+            "leave_count": row["leave_count"],
+            "on_duty_count": row["on_duty_count"],
+        })
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
