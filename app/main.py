@@ -569,8 +569,68 @@ def late_leaderboard(month: MonthParam, limit: Annotated[int, Query(ge=1, le=50)
     return {"month": month, "items": items}
 
 
+def round4_expr(x) -> dict:
+    # half-up to 4 decimals inside the pipeline ($round is half-even)
+    return {"$divide": [{"$floor": {"$add": [{"$multiply": [x, 10000]}, 0.5]}}, 10000]}
+
+
+def department_trend_pipeline(emp_codes: list, joined: list, date_from: str, date_to: str) -> list:
+    start = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
+    end = datetime.fromisoformat(date_to).replace(tzinfo=timezone.utc) + timedelta(days=1)  # bounds upper is exclusive
+    return [
+        {"$match": {"emp_code": {"$in": emp_codes}, "date": {"$gte": date_from, "$lte": date_to}}},
+        {"$group": {
+            "_id": "$date",
+            "present_count": {"$sum": PRESENT_VALUE},
+            "late_count": {"$sum": {"$cond": [IS_LATE, 1, 0]}},
+        }},
+        {"$project": {"_id": 0, "day": {"$dateFromString": {"dateString": "$_id"}}, "present_count": 1, "late_count": 1}},
+        {"$densify": {"field": "day", "range": {"step": 1, "unit": "day", "bounds": [start, end]}}},
+        {"$addFields": {
+            "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$day"}},
+            "is_working_day": {"$lte": [{"$isoDayOfWeek": "$day"}, 5]},
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+        }},
+        {"$addFields": {  # R9: department employees who had joined by that day
+            "headcount": {"$size": {"$filter": {"input": joined, "cond": {"$lte": ["$$this", "$date"]}}}},
+        }},
+        {"$addFields": {
+            "attendance_rate": {"$cond": [
+                {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                round4_expr({"$divide": ["$present_count", "$headcount"]}),
+                None,
+            ]},
+        }},
+        {"$setWindowFields": {
+            "sortBy": {"day": 1},
+            "output": {"moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}},
+        }},
+        {"$sort": {"day": 1}},
+        {"$project": {"_id": 0, "day": 0}},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, date_from: Annotated[str, Query(alias="from")], date_to: Annotated[str, Query(alias="to")]):
+    date_from, date_to = query_date(date_from), query_date(date_to)
+    span = (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days + 1
+    if span < 1:
+        raise HTTPException(422, "to must not be before from")
+    if span > 92:
+        raise HTTPException(422, "range must not exceed 92 days")
+    members = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not members:
+        raise HTTPException(404, "department not found")
+    pipeline = department_trend_pipeline([e["emp_code"] for e in members], [e["joined_on"] for e in members], date_from, date_to)
+    items = list(db.attendance_logs.aggregate(pipeline))
+    for row in items:
+        if row["moving_avg_7d"] is not None:
+            row["moving_avg_7d"] = round_half_up(row["moving_avg_7d"], 4)
+    return {"department": department, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
