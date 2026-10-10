@@ -9,16 +9,17 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
 
@@ -161,20 +162,59 @@ def derived_fields(emp: dict, date_str: str, punch_in: Optional[datetime], punch
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
+HHMM_RE = r"^([01]\d|2[0-3]):[0-5]\d$"
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+PresenceStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
+# StrictInt rejects floats/strings/bools; bounds reject seconds-looking values
+EpochMillis = Annotated[StrictInt, Field(ge=100_000_000_000, le=4_102_444_800_000)]
+
+
+def check_date(s: str) -> str:
+    if not re.fullmatch(DATE_RE, s):
+        raise ValueError("date must be YYYY-MM-DD")
+    date.fromisoformat(s)  # rejects 2026-13-45
+    return s
+
+
+def query_date(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        return check_date(s)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field("09:30", pattern=HHMM_RE)
+    shift_end: str = Field("18:30", pattern=HHMM_RE)
     joined_on: str
+
+    @field_validator("joined_on")
+    @classmethod
+    def _joined_on(cls, v: str) -> str:
+        return check_date(v)
+
+    @model_validator(mode="after")
+    def _shift_differs(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[EpochMillis] = None
+    status: PresenceStatus = "PRESENT"
+
+
+PageParam = Annotated[int, Query(ge=1)]
+PageSizeParam = Annotated[int, Query(ge=1, le=100)]
 
 
 # --------------------------------------------------------------------------- #
@@ -191,60 +231,57 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = now_utc()
+    try:
+        db.employees.insert_one(doc)  # unique index decides the winner under concurrency
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+    return serialize_employee(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(department: Optional[str] = None, page: PageParam = 1, page_size: PageSizeParam = 20):
     q = {}
     if department:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    total = db.employees.count_documents(q)
+    cursor = db.employees.find(q).sort("emp_code", ASCENDING).skip((page - 1) * page_size).limit(page_size)
+    return {"items": [serialize_employee(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
+
+
+def get_employee_or_404(emp_code: str) -> dict:
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    return emp
 
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
-    emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    emp = get_employee_or_404(body.emp_code)
+    ts = ms_to_dt(body.punched_at) if body.punched_at else now_utc()
+    d = attendance_date(ts, emp)
     doc = {
         "emp_code": body.emp_code,
         "date": d,
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
-        "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
-        "overtime_minutes": 0,
-        "half_day": False,
+        **derived_fields(emp, d, ts, None),
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)  # unique (emp_code, date) index makes this race-safe
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return serialize_log(doc)
 
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
-):
+def attendance_query(emp_code, date_from, date_to, status) -> dict:
+    date_from, date_to = query_date(date_from), query_date(date_to)
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must not be after date_to")
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
@@ -256,13 +293,25 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    return q
+
+
+ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    page: PageParam = 1,
+    page_size: PageSizeParam = 20,
+):
+    q = attendance_query(emp_code, date_from, date_to, status)
+    total = db.attendance_logs.count_documents(q)
+    cursor = db.attendance_logs.find(q).sort(ATTENDANCE_SORT).skip((page - 1) * page_size).limit(page_size)
+    return {"items": [serialize_log(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
