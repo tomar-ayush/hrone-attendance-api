@@ -8,6 +8,7 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+import calendar
 import os
 import re
 from contextlib import asynccontextmanager
@@ -407,8 +408,74 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
 
 
 # --------------------------------------------------------------------------- #
+# Analytics
+# --------------------------------------------------------------------------- #
+PRESENT_STATUSES = ["PRESENT", "WFH", "ON_DUTY"]
+MonthParam = Annotated[str, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")]
+
+
+def round_half_up(value, places: int) -> float:
+    q = Decimal(1).scaleb(-places)
+    return float(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
+
+
+def month_bounds(month: str) -> tuple[date, date]:
+    y, m = map(int, month.split("-"))
+    return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+
+def working_days(first: date, last: date, joined_on: str) -> int:
+    # R7: Mon-Fri, counted from joined_on for mid-period joiners
+    start = max(first, date.fromisoformat(joined_on))
+    return sum(1 for i in range((last - start).days + 1) if (start + timedelta(days=i)).weekday() < 5)
+
+
+# aggregation expressions shared by the analytics pipelines
+IS_PRESENT = {"$in": ["$status", PRESENT_STATUSES]}
+IS_WEEKDAY = {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 5]}
+PRESENT_VALUE = {"$cond": [IS_PRESENT, {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1]}, 0]}
+LATE_MINUTES = {"$ifNull": ["$late_minutes", 0]}
+IS_LATE = {"$gt": [LATE_MINUTES, 0]}
+
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list:
+    first, last = month_bounds(month)
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": {"$cond": [IS_WEEKDAY, PRESENT_VALUE, 0]}},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [IS_LATE, 1, 0]}},
+            "total_late_minutes": {"$sum": LATE_MINUTES},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: MonthParam):
+    emp = get_employee_or_404(emp_code)
+    first, last = month_bounds(month)
+    rows = list(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, month)))
+    agg = rows[0] if rows else {}
+    wd = working_days(first, last, emp["joined_on"])
+    present = agg.get("present_days", 0)
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": wd,
+        "present_days": present,
+        "leave_days": agg.get("leave_days", 0),
+        "late_count": agg.get("late_count", 0),
+        "total_late_minutes": agg.get("total_late_minutes", 0),
+        "total_overtime_minutes": agg.get("total_overtime_minutes", 0),
+        "attendance_pct": round_half_up(Decimal(str(present)) / wd * 100, 2) if wd else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
