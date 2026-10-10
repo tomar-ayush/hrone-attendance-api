@@ -10,7 +10,8 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -97,21 +98,64 @@ def serialize_log(doc: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def hhmm(s: str) -> time:
+    h, m = map(int, s.split(":"))
+    return time(h, m)
+
+
+def is_overnight(emp: dict) -> bool:
+    return hhmm(emp["shift_end"]) <= hhmm(emp["shift_start"])
+
+
+def attendance_date(punch_in: datetime, emp: dict) -> str:
+    # R1: IST calendar date of the punch-in; for an overnight shift a punch-in
+    # earlier than shift_end belongs to the shift that started the day before
+    local = punch_in.astimezone(IST)
+    d = local.date()
+    if is_overnight(emp) and local.time() < hhmm(emp["shift_end"]):
+        d -= timedelta(days=1)
+    return d.isoformat()
+
+
+def shift_bounds(date_str: str, emp: dict) -> tuple[datetime, datetime]:
+    d = date.fromisoformat(date_str)
+    start = datetime.combine(d, hhmm(emp["shift_start"]), tzinfo=IST)
+    end = datetime.combine(d, hhmm(emp["shift_end"]), tzinfo=IST)
+    if end <= start:
+        end += timedelta(days=1)
+    return start, end
+
+
+def compute_late_minutes(punch_in: datetime, shift_start: datetime) -> int:
+    # R2: late only if strictly more than 10:00 after shift start; floor minutes since shift start
+    seconds = (punch_in - shift_start).total_seconds()
+    return int(seconds // 60) if seconds > 600 else 0
+
+
+def compute_overtime(punch_out: datetime, shift_end: datetime) -> int:
+    # R3: floor minutes after shift end, counted only when >= 30
+    minutes = int((punch_out - shift_end).total_seconds() // 60)
+    return minutes if minutes >= 30 else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    # R4: seconds / 3600, 2 decimals half-up
+    hours = Decimal((punch_out - punch_in).total_seconds()) / Decimal(3600)
+    return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def derived_fields(emp: dict, date_str: str, punch_in: Optional[datetime], punch_out: Optional[datetime]) -> dict:
+    # Everything the API computes for a record (R2-R5), from the final punch times
+    out = {"work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    if punch_in is None:
+        return out
+    start, end = shift_bounds(date_str, emp)
+    out["late_minutes"] = compute_late_minutes(punch_in, start)
+    if punch_out is not None:
+        out["work_hours"] = compute_work_hours(punch_in, punch_out)
+        out["overtime_minutes"] = compute_overtime(punch_out, end)
+        out["half_day"] = out["work_hours"] < 4.5  # R5
+    return out
 
 
 # --------------------------------------------------------------------------- #
